@@ -6,6 +6,10 @@
 
 #define R2MCP_DEBUG   1
 #define R2MCP_LOGFILE "/tmp/r2mcp.txt"
+#define BUFFER_SIZE     65536
+#define READ_CHUNK_SIZE 32768
+#define LATEST_PROTOCOL_VERSION "2024-11-05"
+
 
 static inline void r2mcp_log(const char *x) {
 #if R2MCP_DEBUG
@@ -41,12 +45,6 @@ static const char *r_json_get_str(const RJson *json, const char *key) {
 
 	return field->str_value;
 }
-
-#define PORT            3000
-#define BUFFER_SIZE     65536
-#define READ_CHUNK_SIZE 32768
-
-#define LATEST_PROTOCOL_VERSION "2024-11-05"
 
 typedef struct {
 	const char *name;
@@ -156,41 +154,6 @@ ReadBuffer *read_buffer_new(void) {
 	return buf;
 }
 
-static void read_buffer_append(ReadBuffer *buf, const char *data, size_t len) {
-	if (buf->size + len > buf->capacity) {
-		size_t new_capacity = buf->capacity * 2;
-		char *new_data = realloc (buf->data, new_capacity);
-		if (!new_data) {
-			R_LOG_ERROR ("Failed to resize buffer");
-			return;
-		}
-		buf->data = new_data;
-		buf->capacity = new_capacity;
-	}
-	memcpy (buf->data + buf->size, data, len);
-	buf->size += len;
-}
-
-static char *read_buffer_get_message(ReadBuffer *buf) {
-	char *newline = memchr (buf->data, '\n', buf->size);
-	if (!newline) {
-		return NULL;
-	}
-
-	size_t msg_len = newline - buf->data;
-	char *msg = malloc (msg_len + 1);
-	memcpy (msg, buf->data, msg_len);
-	msg[msg_len] = '\0';
-
-	size_t remaining = buf->size - (msg_len + 1);
-	if (remaining > 0) {
-		memmove (buf->data, newline + 1, remaining);
-	}
-	buf->size = remaining;
-
-	return msg;
-}
-
 static void read_buffer_free(ReadBuffer *buf) {
 	if (buf) {
 		free (buf->data);
@@ -198,7 +161,7 @@ static void read_buffer_free(ReadBuffer *buf) {
 	}
 }
 
-static char *get_capabilities();
+static char *get_capabilities(void);
 static char *handle_initialize(RJson *params);
 static char *handle_list_tools(RJson *params);
 static char *handle_call_tool(RJson *params);
@@ -298,12 +261,10 @@ static bool r2_analyze(int level) {
 }
 
 static void signal_handler(int signum) {
-	const char msg[] = "\nInterrupt received, shutting down...\n";
-	write (STDERR_FILENO, msg, sizeof (msg) - 1);
-
+	eprintf ("\nInterrupt received %d, shutting down...\n", signum);
 	running = 0;
 
-	signal (signum, SIG_DFL);
+	// signal (signum, SIG_DFL);
 }
 
 static bool check_client_capability(const char *capability) {
@@ -451,6 +412,10 @@ static char *handle_mcp_request(const char *method, RJson *params, const char *i
 		return response;
 	}
 
+	// R_LOG_INFO ("METHOD (%s)", method);
+	if (!strcmp (method, "notifications/initialized")) {
+		return NULL;
+	}
 	if (!strcmp (method, "initialize")) {
 		result = handle_initialize (params);
 	} else if (!strcmp (method, "ping")) {
@@ -468,6 +433,7 @@ static char *handle_mcp_request(const char *method, RJson *params, const char *i
 	} else if (!strcmp (method, "tools/call") || !strcmp (method, "tool/call")) {
 		result = handle_call_tool (params);
 	} else {
+		R_LOG_ERROR ("Unknown method");
 		return create_error_response (-32601, "Unknown method", id, NULL);
 	}
 
@@ -477,29 +443,25 @@ static char *handle_mcp_request(const char *method, RJson *params, const char *i
 }
 
 static char *handle_initialize(RJson *params) {
-	if (server_state.client_capabilities) {
-		r_json_free (server_state.client_capabilities);
-	}
-	if (server_state.client_info) {
-		r_json_free (server_state.client_info);
-	}
-
 	server_state.client_capabilities = (RJson *)r_json_get (params, "capabilities");
 	server_state.client_info = (RJson *)r_json_get (params, "clientInfo");
 
 	PJ *pj = pj_new ();
 	pj_o (pj);
 	pj_ks (pj, "protocolVersion", LATEST_PROTOCOL_VERSION);
-	pj_k (pj, "serverInfo");
-	pj_o (pj);
+	pj_ko (pj, "serverInfo");
 	pj_ks (pj, "name", server_state.info.name);
 	pj_ks (pj, "version", server_state.info.version);
 	pj_end (pj);
+	pj_ko (pj, "experimental");
+	pj_end (pj);
+	pj_ko (pj, "prompts");
 	pj_k (pj, "capabilities");
 	pj_raw (pj, get_capabilities ());
 	if (server_state.instructions) {
 		pj_ks (pj, "instructions", server_state.instructions);
 	}
+	pj_end (pj);
 	pj_end (pj);
 
 	server_state.initialized = true;
@@ -510,8 +472,17 @@ static char *get_capabilities(void) {
 	PJ *pj = pj_new ();
 	pj_o (pj);
 
-	pj_k (pj, "tools");
-	pj_o (pj);
+	pj_ko (pj, "tools");
+	pj_kb (pj, "listChanged", false);
+	pj_end (pj);
+
+	pj_ko (pj, "prompts");
+	pj_kb (pj, "listChanged", false);
+	pj_end (pj);
+
+	pj_ko (pj, "resources");
+	pj_kb (pj, "listChanged", false);
+	pj_kb (pj, "subscribe", false);
 	pj_end (pj);
 
 	pj_end (pj);
@@ -985,11 +956,14 @@ static void process_mcp_message(const char *msg) {
 		}
 
 		char *response = handle_mcp_request (method, params, id);
-
-		// Write directly to stdout to ensure no extra output
-		write (STDOUT_FILENO, response, strlen (response));
-		write (STDOUT_FILENO, "\n", 1);
-		fflush (stdout);
+		if (response) {
+			char *s = r_str_newf ("%s\n", response);
+			write (STDOUT_FILENO, s, strlen (s));
+			// write (STDOUT_FILENO, s, 0);
+			fflush (stdout);
+			R_LOG_INFO ("sent: %s", response);
+			free (s);
+		}
 
 		free (response);
 	} else {
@@ -1006,55 +980,20 @@ static void direct_mode_loop(void) {
 	ReadBuffer *buffer = read_buffer_new ();
 	char chunk[READ_CHUNK_SIZE];
 
-	int flags = fcntl (STDIN_FILENO, F_GETFL, 0);
-	fcntl (STDIN_FILENO, F_SETFL, flags | O_NONBLOCK);
-
-	struct timeval tv;
-	fd_set readfds;
-
 	while (running) {
-		FD_ZERO (&readfds);
-		FD_SET (STDIN_FILENO, &readfds);
-
-		tv.tv_sec = 0;
-		tv.tv_usec = 100000;
-
-		int ret = select (STDIN_FILENO + 1, &readfds, NULL, NULL, &tv);
-
-		if (ret < 0) {
-			if (errno != EINTR) {
-				R_LOG_ERROR ("Select: %s", strerror (errno));
+		memset (chunk, 0, sizeof (chunk));
+		int bytes_read = read (STDIN_FILENO, chunk, READ_CHUNK_SIZE);
+		if (bytes_read > 0) {
+			// read_buffer_append (buffer, chunk, bytes_read);
+			R_LOG_INFO ("[recv] %s", chunk);
+			process_mcp_message (chunk);
+		} else if (bytes_read == 0) {
+			R_LOG_INFO ("End of input stream");
+			break;
+		} else {
+			if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
+				R_LOG_ERROR ("Reading from stdin: %s", strerror (errno));
 				break;
-			}
-			continue;
-		}
-
-		if (ret == 0) {
-			if (write (STDOUT_FILENO, "", 0) < 0) {
-				R_LOG_WARN ("Client disconnected (stdout closed)");
-				break;
-			}
-			continue;
-		}
-
-		if (FD_ISSET (STDIN_FILENO, &readfds)) {
-			ssize_t bytes_read = read (STDIN_FILENO, chunk, READ_CHUNK_SIZE);
-
-			if (bytes_read > 0) {
-				read_buffer_append (buffer, chunk, bytes_read);
-				char *msg;
-				while ((msg = read_buffer_get_message (buffer)) != NULL) {
-					process_mcp_message (msg);
-					free (msg);
-				}
-			} else if (bytes_read == 0) {
-				R_LOG_INFO ("End of input stream");
-				break;
-			} else {
-				if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
-					R_LOG_ERROR ("Reading from stdin: %s", strerror (errno));
-					break;
-				}
 			}
 		}
 	}

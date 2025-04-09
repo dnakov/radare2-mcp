@@ -1,4 +1,6 @@
 Use `cat | ./r2mcp | cat` to debug the tool and paste some json objects
 
+
+{"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{"sampling":{},"roots":{"listChanged":true}},"clientInfo":{"name":"mcp","version":"0.1.0"}},"jsonrpc":"2.0","id":0}
 {"method":"tools/call","params":{"name":"openFile","arguments":{"filePath":"/bin/ls"}},"jsonrpc":"2.0","id":1}
 {"method":"tools/call","params":{"name":"listLibraries","arguments":{}},"jsonrpc":"2.0","id":17}
