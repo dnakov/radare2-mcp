@@ -65,6 +65,23 @@ typedef struct {
 	RJson *client_info;
 } ServerState;
 
+typedef struct {
+	char *data;
+	size_t size;
+	size_t capacity;
+} ReadBuffer;
+
+// Read buffer functions
+static void read_buffer_append(ReadBuffer *buf, const char *data, size_t length) {
+	if (buf->size + length >= buf->capacity) {
+		buf->capacity = (buf->size + length) * 2;
+		buf->data = realloc(buf->data, buf->capacity);
+	}
+	memcpy(buf->data + buf->size, data, length);
+	buf->size += length;
+	buf->data[buf->size] = '\0';
+}
+
 // TODO: remove globals
 static RCore *r_core = NULL;
 static bool file_opened = false;
@@ -87,19 +104,62 @@ static ServerState server_state = {
 static void process_mcp_message(const char *msg);
 static void direct_mode_loop(void);
 
+// Process a complete JSON message from the buffer
+static void process_buffer(ReadBuffer *buffer) {
+	char *start = buffer->data;
+	char *newline = strchr(start, '\n');
+	
+	while (newline) {
+		*newline = '\0';
+		if (newline > start) {  // Skip empty lines
+			process_mcp_message(start);
+		}
+		size_t processed = newline - buffer->data + 1;
+		buffer->size -= processed;
+		memmove(buffer->data, buffer->data + processed, buffer->size);
+		buffer->data[buffer->size] = '\0';
+		
+		// Look for next message
+		start = buffer->data;
+		newline = strchr(start, '\n');
+	}
+}
+
 #define JSON_RPC_VERSION "2.0"
 #define MCP_VERSION      "2024-11-05"
 
-typedef struct {
-	char *data;
-	size_t size;
-	size_t capacity;
-} ReadBuffer;
+// Set stdout to line buffering mode at program start
+static void init_buffering(void) {
+	// Set stdin to unbuffered mode
+	setvbuf(stdin, NULL, _IONBF, 0);
+	// Set stdout to line buffered mode
+	setvbuf(stdout, NULL, _IOLBF, 0);
+}
+
+ReadBuffer *read_buffer_new(void) {
+	ReadBuffer *buf = R_NEW (ReadBuffer);
+	buf->data = malloc (BUFFER_SIZE);
+	buf->size = 0;
+	buf->capacity = BUFFER_SIZE;
+	return buf;
+}
+
+static void read_buffer_free(ReadBuffer *buf) {
+	if (buf) {
+		free (buf->data);
+		free (buf);
+	}
+}
 
 static void r2_settings(RCore *core) {
 	r_config_set_i (core->config, "scr.color", 0);
-	r_config_set_b (core->config, "scr.utf8", false);
+	r_config_set_b (core->config, "scr.prompt", false);
+	r_config_set_b (core->config, "scr.echo", false);
+	r_config_set_b (core->config, "scr.flush", true);
 	r_config_set_b (core->config, "scr.interactive", false);
+	r_config_set_b (core->config, "scr.null", false);
+	r_config_set_b (core->config, "scr.pipecolor", false);
+	r_config_set_b (core->config, "scr.utf8", false);
 	r_config_set_b (core->config, "emu.str", true);
 	r_config_set_b (core->config, "asm.bytes", false);
 	r_config_set_b (core->config, "asm.lines.fcn", false);
@@ -144,21 +204,6 @@ static char *r2_cmd(const char *cmd) {
 	free (filteredCommand);
 	r2_settings (r_core);
 	return res;
-}
-
-ReadBuffer *read_buffer_new(void) {
-	ReadBuffer *buf = R_NEW (ReadBuffer);
-	buf->data = malloc (BUFFER_SIZE);
-	buf->size = 0;
-	buf->capacity = BUFFER_SIZE;
-	return buf;
-}
-
-static void read_buffer_free(ReadBuffer *buf) {
-	if (buf) {
-		free (buf->data);
-		free (buf);
-	}
 }
 
 static char *get_capabilities(void);
@@ -925,7 +970,7 @@ static char *handle_call_tool(RJson *params) {
 	return create_error_response (-32602, format_string ("Unknown tool: %s", tool_name), NULL, NULL);
 }
 
-// Added back the direct_mode_loop implementation
+// Process a complete JSON message
 static void process_mcp_message(const char *msg) {
 	r2mcp_log ("<<<");
 	r2mcp_log (msg);
@@ -959,13 +1004,12 @@ static void process_mcp_message(const char *msg) {
 		if (response) {
 			char *s = r_str_newf ("%s\n", response);
 			write (STDOUT_FILENO, s, strlen (s));
-			// write (STDOUT_FILENO, s, 0);
+			fsync(STDOUT_FILENO);
 			fflush (stdout);
 			R_LOG_INFO ("sent: %s", response);
 			free (s);
+			free (response);
 		}
-
-		free (response);
 	} else {
 		// We don't handle notifications anymore
 		R_LOG_INFO ("Ignoring notification: %s", method);
@@ -974,25 +1018,34 @@ static void process_mcp_message(const char *msg) {
 	r_json_free (request);
 }
 
+// Direct mode loop for processing stdin/stdout
 static void direct_mode_loop(void) {
 	R_LOG_INFO ("Running in MCP direct mode (stdin/stdout)");
-
+	
+	// Ensure proper buffering modes
+	init_buffering();
+	
 	ReadBuffer *buffer = read_buffer_new ();
 	char chunk[READ_CHUNK_SIZE];
+	
+	r2mcp_log("Direct mode started - waiting for input");
 
 	while (running) {
 		memset (chunk, 0, sizeof (chunk));
 		int bytes_read = read (STDIN_FILENO, chunk, READ_CHUNK_SIZE);
+		
 		if (bytes_read > 0) {
-			// read_buffer_append (buffer, chunk, bytes_read);
-			R_LOG_INFO ("[recv] %s", chunk);
-			process_mcp_message (chunk);
+			// Add the chunk to our buffer and process any complete messages
+			read_buffer_append (buffer, chunk, bytes_read);
+			process_buffer (buffer);
 		} else if (bytes_read == 0) {
+			// EOF
 			R_LOG_INFO ("End of input stream");
 			break;
 		} else {
+			// Error or would block
 			if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
-				R_LOG_ERROR ("Reading from stdin: %s", strerror (errno));
+				r2mcp_log("Reading from stdin error");
 				break;
 			}
 		}
@@ -1005,6 +1058,9 @@ static void direct_mode_loop(void) {
 int main(int argc, char **argv) {
 	(void)argc;
 	(void)argv;
+	
+	// Initialize buffering modes early
+	init_buffering();
 
 	struct sigaction sa = { 0 };
 	sa.sa_handler = signal_handler;
@@ -1014,8 +1070,6 @@ int main(int argc, char **argv) {
 
 	sigaction (SIGINT, &sa, NULL);
 	sigaction (SIGTERM, &sa, NULL);
-	sigaction (SIGHUP, &sa, NULL);
-
 	signal (SIGPIPE, SIG_IGN);
 
 	if (!init_r2 ()) {
